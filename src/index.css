@@ -1,0 +1,57 @@
+@import "tailwindcss";
+
+@theme {
+  --color-blush: #FFF0F3;
+  --color-primary: #FF5C8D;
+  --color-primary-btn: #C72A63;
+  --color-primary-btn-hover: #A82253;
+  --color-berry: #4A0E2E;
+  --color-berry-muted: #7A3556;
+  --font-sans: "Plus Jakarta Sans", system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+  --font-tamil: "Noto Sans Tamil", "Latha", "Vijaya", "Nirmala UI", sans-serif;
+}
+
+:root {
+  color-scheme: light;
+  font-family: var(--font-sans);
+}
+
+body {
+  margin: 0;
+  min-height: 100vh;
+  background-color: var(--color-blush);
+  color: var(--color-berry);
+  -webkit-font-smoothing: antialiased;
+  -moz-osx-font-smoothing: grayscale;
+  overflow-x: hidden;
+}
+
+/* Tamil font class */
+.font-tamil {
+  font-family: var(--font-tamil);
+}
+
+/* Custom dashed stitch border motif - strictly for ONE main card per screen */
+.card-stitched {
+  position: relative;
+  border: 2.5px dashed #FF5C8D;
+  border-radius: 1.5rem;
+  background-color: #ffffff;
+  box-shadow: 0 4px 20px -2px rgba(255, 92, 141, 0.12);
+  transition: transform 0.2s ease, box-shadow 0.2s ease;
+}
+
+/* Focus visibility for accessibility */
+button:focus-visible,
+a:focus-visible,
+input:focus-visible,
+select:focus-visible {
+  outline: 2px solid #FF5C8D;
+  outline-offset: 2px;
+}
+
+/* Touch target minimum 44px */
+.touch-target-min {
+  min-width: 44px;
+  min-height: 44px;
+}
