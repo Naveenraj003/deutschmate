@@ -7,12 +7,12 @@ import type { UIState } from '../../types/auth'
  * RULE: Strictly gated behind import.meta.env.DEV so it is never included in production bundles.
  */
 export const DevStateToolbar: React.FC = () => {
+  const { user, toggleRole, uiState, setUIState } = useAuth()
+
   // Never render in production
   if (!import.meta.env.DEV) {
     return null
   }
-
-  const { user, toggleRole, uiState, setUIState } = useAuth()
 
   const states: UIState[] = ['normal', 'loading', 'empty', 'error']
 
