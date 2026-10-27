@@ -10,20 +10,27 @@ jobs:
   test:
     name: Run pgTAP & RLS Security Tests
     runs-on: ubuntu-latest
+    timeout-minutes: 20
 
     steps:
-      - name: Checkout code
+      - name: Checkout repository
         uses: actions/checkout@v4
 
       - name: Setup Supabase CLI
-        uses: supabase/setup-cli@v1
+        uses: supabase/setup-cli@v3
         with:
           version: 2.122.0
 
       - name: Start local Supabase stack
         run: supabase start
-        working-directory: ./
 
       - name: Run Database Tests
         run: supabase test db
-        working-directory: ./
+
+      - name: Verify working tree under supabase/ is clean
+        run: |
+          if [ -n "$(git status --porcelain supabase/)" ]; then
+            echo "Error: Working tree under supabase/ has uncommitted modifications:"
+            git status --porcelain supabase/
+            exit 1
+          fi

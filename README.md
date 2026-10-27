@@ -66,7 +66,7 @@ When the offline or sync client submits learning events to Supabase:
    - Missing profile lookup raises SQLSTATE `P0002` (no UTC fallback).
 
 4. **Timezone Changes & Streak Impact**:
-   - The frontend automatically detects the browser's IANA timezone (e.g., via `Intl.DateTimeFormat().resolvedOptions().timeZone`) and updates `profiles.timezone` on login if different.
+   - Automatic browser timezone detection (e.g., via `Intl.DateTimeFormat().resolvedOptions().timeZone`) on login is **planned** for upcoming releases; currently, timezone defaults during signup and can be updated by active learners.
    - Historical events store immutable `reward_date` values recorded at insertion time. A subsequent timezone change only shifts future daily boundaries; it never mutates historical reward dates.
 
 ---
@@ -99,10 +99,23 @@ To promote the initial trusted administrator:
 
 ## Running Database Tests (pgTAP) & CI
 
-A test suite verifying RLS boundaries, column update rejections, idempotency, streak cases, and admin RPC security is located at `supabase/tests/security_and_rls_test.sql` (67 tests).
+A test suite verifying RLS boundaries, column update rejections, idempotency, streak cases, and admin RPC security is located at `supabase/tests/security_and_rls_test.sql` (69 assertions).
+
+### Assertion-Tag Convention
+Every assertion description in `security_and_rls_test.sql` begins with a unique, stable bracketed tag:
+```sql
+SELECT throws_ok(
+  'INSERT INTO public.learning_events (id, created_at, event_type) VALUES (gen_random_uuid(), now(), ''lesson_completed'')',
+  '42501',
+  '[events-forged-created-at] Inserting explicit created_at throws 42501'
+);
+```
+- **Mutation Registry**: The mutation test runner (`scripts/mutation-check.sh`) registers only the tag (e.g. `[events-forged-created-at]`).
+- **Failure-Only Matching**: During mutation verification, the runner requires `Result: FAIL` and matches the tag exclusively on TAP failure lines (`not ok` or lines containing `Failed test`), ensuring passing `ok` lines are never matched.
+- **Reporting**: All failing tags from a run are extracted and printed, classifying the execution as `DETECTED`, `SURVIVED`, or `ERROR`.
 
 ### GitHub Actions CI
-Automated testing is configured in `.github/workflows/db-tests.yml` using `supabase/setup-cli@v1` and `supabase test db`.
+Automated testing is configured in `.github/workflows/db-tests.yml` (push and pull request on `main`) and `.github/workflows/mutation-tests.yml` (workflow_dispatch running 7 matrix mutations against baseline). Workflows use `supabase/setup-cli@v3` pinned to version `2.122.0` (verified against npm registry: https://www.npmjs.com/package/supabase).
 
 ### Local Execution
 ```bash

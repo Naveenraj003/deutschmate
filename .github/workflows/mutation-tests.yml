@@ -1,0 +1,60 @@
+name: Database Mutation Tests
+
+on:
+  workflow_dispatch:
+  # Weekly run commented out until manual run succeeds
+  # schedule:
+  #   - cron: '0 0 * * 0'
+
+jobs:
+  baseline:
+    name: Baseline Test Suite
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Setup Supabase CLI
+        uses: supabase/setup-cli@v3
+        with:
+          version: 2.122.0
+
+      - name: Start local Supabase stack
+        run: supabase start
+
+      - name: Run baseline pgTAP tests
+        run: supabase test db
+
+  mutation:
+    name: Mutation Check (${{ matrix.mutation.id }})
+    needs: baseline
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    strategy:
+      fail-fast: false
+      matrix:
+        mutation:
+          - id: mutation_1_grant_insert_created_at
+          - id: mutation_2_remove_is_active_from_events_insert
+          - id: mutation_3_trigger_ignores_client_created_at
+          - id: mutation_4_remove_streak_end_date_filter
+          - id: mutation_5_remove_least_xp_cap
+          - id: mutation_6_grant_update_role
+          - id: mutation_7_remove_exercise_incorrect_from_streak
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Setup Supabase CLI
+        uses: supabase/setup-cli@v3
+        with:
+          version: 2.122.0
+
+      - name: Start local Supabase stack
+        run: supabase start
+
+      - name: Run targeted mutation
+        run: bash scripts/mutation-check.sh "${{ matrix.mutation.id }}"
