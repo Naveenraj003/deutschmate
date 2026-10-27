@@ -1,5 +1,5 @@
 -- Migration 00004: Admin RPCs and server-derived aggregate functions
--- Description: SECURITY DEFINER operations for admin user management, feedback status, and progress reporting using reward_date.
+-- Description: SECURITY DEFINER operations for admin user management, feedback status, and progress reporting using local_reward_date.
 
 -- 1. admin_set_user_active
 -- Toggles learner active status. Rejects self-deactivation and non-admin calls.
@@ -14,7 +14,6 @@ SET search_path = ''
 AS $$
 DECLARE
   v_caller_id uuid;
-  v_target_role text;
 BEGIN
   v_caller_id := (SELECT auth.uid());
 
@@ -31,11 +30,7 @@ BEGIN
   END IF;
 
   -- 3. Verify target exists
-  SELECT role INTO v_target_role
-  FROM public.profiles
-  WHERE id = target_user_id;
-
-  IF NOT FOUND THEN
+  IF NOT EXISTS (SELECT 1 FROM public.profiles WHERE id = target_user_id) THEN
     RAISE EXCEPTION 'Target user profile not found for id %', target_user_id
       USING ERRCODE = '02000';
   END IF;
@@ -110,7 +105,7 @@ $$;
 --        ('lesson_completed', 'exercise_correct', 'review_correct', 'exercise_incorrect').
 --      * Days containing ONLY exercise_incorrect maintain the streak (0 XP earned).
 --      * Group consecutive dates by (reward_date - row_number):
---        The current streak is the run ending today or yesterday (relative to user's current timezone).
+--        The current streak is the run ending today or yesterday (derived via local_reward_date(now(), v_user_tz)).
 --      * Note: a later timezone change can shift today's boundary once, but historical reward_date is immutable.
 CREATE OR REPLACE FUNCTION public.get_admin_learner_summary(
   target_user_id uuid
@@ -136,7 +131,7 @@ BEGIN
       USING ERRCODE = '42501';
   END IF;
 
-  -- 2. Look up learner timezone and existence
+  -- 2. Look up learner timezone and existence (profiles.timezone is NOT NULL)
   SELECT timezone INTO v_user_tz
   FROM public.profiles
   WHERE id = target_user_id;
@@ -144,10 +139,6 @@ BEGIN
   IF NOT FOUND THEN
     RAISE EXCEPTION 'User profile not found for id %', target_user_id
       USING ERRCODE = '02000';
-  END IF;
-
-  IF v_user_tz IS NULL OR v_user_tz = '' THEN
-    v_user_tz := 'UTC';
   END IF;
 
   -- 3. Determine last active timestamp and total events count
@@ -186,8 +177,8 @@ BEGIN
   FROM daily_capped_xp;
 
   -- 5. Calculate Consecutive Streak Days using (reward_date - row_number)
-  -- Eligible streak events explicitly encode: lesson_completed, exercise_correct, review_correct, exercise_incorrect
-  v_today := (now() AT TIME ZONE v_user_tz)::date;
+  -- Uses public.local_reward_date for today's boundary
+  v_today := public.local_reward_date(now(), v_user_tz);
   v_yesterday := v_today - 1;
 
   WITH active_dates AS (

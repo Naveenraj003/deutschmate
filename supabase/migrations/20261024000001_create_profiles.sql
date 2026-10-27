@@ -1,8 +1,24 @@
--- Migration 00001: Create profiles table, signup trigger, and RLS policies
--- Description: Establishes learner profiles mapped 1:1 to auth.users, column privileges, timezone validation, and security boundaries.
+-- Migration 00001: Create profiles table, signup trigger, timezone helpers, and RLS policies
+-- Description: Establishes learner profiles mapped 1:1 to auth.users, column privileges, pg_catalog timezone validation, and security boundaries.
 
--- 1. Create timezone validation function
--- Ensures timezone is non-null, non-empty, and strictly present in pg_timezone_names
+-- 1. Create helper: public.local_reward_date
+-- Returns local date for a timestamp in a given timezone; SECURITY INVOKER, STABLE with empty search_path
+CREATE OR REPLACE FUNCTION public.local_reward_date(ts timestamptz, tz text)
+RETURNS date
+LANGUAGE sql
+STABLE
+SECURITY INVOKER
+SET search_path = ''
+AS $$
+  SELECT (ts AT TIME ZONE tz)::date;
+$$;
+
+-- Revoke default PUBLIC & anon access; grant only to authenticated
+REVOKE ALL ON FUNCTION public.local_reward_date(timestamptz, text) FROM PUBLIC, anon;
+GRANT EXECUTE ON FUNCTION public.local_reward_date(timestamptz, text) TO authenticated;
+
+-- 2. Create timezone validation function
+-- Ensures timezone is non-null, non-empty, and strictly present in pg_catalog.pg_timezone_names
 CREATE OR REPLACE FUNCTION public.validate_timezone_name()
 RETURNS trigger
 LANGUAGE plpgsql
@@ -16,7 +32,7 @@ BEGIN
   END IF;
 
   IF NOT EXISTS (
-    SELECT 1 FROM pg_timezone_names WHERE name = NEW.timezone
+    SELECT 1 FROM pg_catalog.pg_timezone_names WHERE name = NEW.timezone
   ) THEN
     RAISE EXCEPTION 'Invalid IANA timezone: %', NEW.timezone
       USING ERRCODE = '22023';
@@ -26,7 +42,7 @@ BEGIN
 END;
 $$;
 
--- 2. Create updated_at trigger helper
+-- 3. Create updated_at trigger helper
 CREATE OR REPLACE FUNCTION public.set_current_timestamp_updated_at()
 RETURNS trigger
 LANGUAGE plpgsql
@@ -39,7 +55,7 @@ BEGIN
 END;
 $$;
 
--- 3. Create table
+-- 4. Create table
 CREATE TABLE IF NOT EXISTS public.profiles (
   id uuid PRIMARY KEY REFERENCES auth.users(id) ON DELETE CASCADE,
   display_name text,
@@ -67,7 +83,7 @@ BEFORE UPDATE ON public.profiles
 FOR EACH ROW
 EXECUTE FUNCTION public.set_current_timestamp_updated_at();
 
--- 4. is_admin() helper function
+-- 5. is_admin() helper function
 -- Must be STABLE SECURITY DEFINER with fixed empty search_path
 CREATE OR REPLACE FUNCTION public.is_admin()
 RETURNS boolean
@@ -85,10 +101,10 @@ AS $$
   );
 $$;
 
--- 5. Enable RLS
+-- 6. Enable RLS
 ALTER TABLE public.profiles ENABLE ROW LEVEL SECURITY;
 
--- 6. Revoke broad permissions and configure column-level security
+-- 7. Revoke broad permissions and configure column-level security
 REVOKE ALL ON TABLE public.profiles FROM anon, PUBLIC;
 REVOKE ALL ON TABLE public.profiles FROM authenticated;
 
@@ -99,7 +115,7 @@ GRANT SELECT ON TABLE public.profiles TO authenticated;
 -- Updates to role, is_active, id, or created_at fail with 42501 permission error.
 GRANT UPDATE (display_name, teaching_language, timezone) ON TABLE public.profiles TO authenticated;
 
--- 7. RLS Policies for profiles
+-- 8. RLS Policies for profiles
 -- Self-SELECT policy: does NOT require is_active so a disabled user can read their own row
 CREATE POLICY "profiles_select_own"
   ON public.profiles
@@ -130,7 +146,7 @@ CREATE POLICY "profiles_update_own"
     (SELECT auth.uid()) = id AND is_active = true
   );
 
--- 8. Signup trigger to create profile
+-- 9. Signup trigger to create profile
 -- Always forces role = 'learner' and is_active = true, ignoring any client-provided role or status.
 CREATE OR REPLACE FUNCTION public.handle_new_user()
 RETURNS trigger
@@ -161,7 +177,7 @@ BEGIN
 
   -- Extract and validate timezone if provided, otherwise default to UTC
   v_raw_tz := trim(COALESCE(NEW.raw_user_meta_data->>'timezone', 'UTC'));
-  IF v_raw_tz IS NOT NULL AND v_raw_tz <> '' AND EXISTS (SELECT 1 FROM pg_timezone_names WHERE name = v_raw_tz) THEN
+  IF v_raw_tz IS NOT NULL AND v_raw_tz <> '' AND EXISTS (SELECT 1 FROM pg_catalog.pg_timezone_names WHERE name = v_raw_tz) THEN
     v_tz := v_raw_tz;
   ELSE
     v_tz := 'UTC';

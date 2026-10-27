@@ -16,8 +16,13 @@ CREATE TABLE IF NOT EXISTS public.learning_events (
   CONSTRAINT check_event_type_allowlist CHECK (
     event_type IN ('lesson_completed', 'exercise_correct', 'review_correct', 'exercise_incorrect')
   ),
+  -- Split constraint (a): exercise_id format for all event types
+  CONSTRAINT check_exercise_id_format CHECK (
+    exercise_id IS NULL OR (char_length(exercise_id) BETWEEN 1 AND 64)
+  ),
+  -- Split constraint (b): exercise_correct and exercise_incorrect require exercise_id IS NOT NULL
   CONSTRAINT check_exercise_events_require_exercise_id CHECK (
-    (event_type IN ('exercise_correct', 'exercise_incorrect') AND exercise_id IS NOT NULL AND char_length(exercise_id) BETWEEN 1 AND 64)
+    (event_type IN ('exercise_correct', 'exercise_incorrect') AND exercise_id IS NOT NULL)
     OR (event_type NOT IN ('exercise_correct', 'exercise_incorrect'))
   ),
   CONSTRAINT check_lesson_id_length CHECK (
@@ -31,7 +36,7 @@ CREATE TABLE IF NOT EXISTS public.learning_events (
   )
 );
 
--- 2. BEFORE INSERT trigger helper: server timestamps, user timezone lookup, no UTC fallback
+-- 2. BEFORE INSERT trigger helper: server timestamps, user timezone lookup, 48h clamp, no UTC fallback
 CREATE OR REPLACE FUNCTION public.set_learning_event_server_fields()
 RETURNS trigger
 LANGUAGE plpgsql
@@ -40,6 +45,7 @@ SET search_path = ''
 AS $$
 DECLARE
   v_tz text;
+  v_event_ts timestamptz;
 BEGIN
   -- Force authoritative user_id from auth.uid() if not already set or defaulted
   IF NEW.user_id IS NULL THEN
@@ -57,9 +63,12 @@ BEGIN
       USING ERRCODE = 'P0002';
   END IF;
 
-  -- Always set created_at and reward_date authoritatively on the server
+  -- Clamp client_created_at between now() - 48 hours and now()
+  v_event_ts := LEAST(now(), GREATEST(COALESCE(NEW.client_created_at, now()), now() - interval '48 hours'));
+
+  -- Always set created_at and reward_date authoritatively on the server using local_reward_date
   NEW.created_at := now();
-  NEW.reward_date := (now() AT TIME ZONE v_tz)::date;
+  NEW.reward_date := public.local_reward_date(v_event_ts, v_tz);
 
   RETURN NEW;
 END;
