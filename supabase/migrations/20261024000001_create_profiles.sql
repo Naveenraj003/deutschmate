@@ -1,7 +1,45 @@
 -- Migration 00001: Create profiles table, signup trigger, and RLS policies
--- Description: Establishes learner profiles mapped 1:1 to auth.users, column privileges, and security boundaries.
+-- Description: Establishes learner profiles mapped 1:1 to auth.users, column privileges, timezone validation, and security boundaries.
 
--- 1. Create table
+-- 1. Create timezone validation function
+-- Ensures timezone is non-null, non-empty, and strictly present in pg_timezone_names
+CREATE OR REPLACE FUNCTION public.validate_timezone_name()
+RETURNS trigger
+LANGUAGE plpgsql
+SECURITY DEFINER
+SET search_path = ''
+AS $$
+BEGIN
+  IF NEW.timezone IS NULL OR trim(NEW.timezone) = '' THEN
+    RAISE EXCEPTION 'Timezone cannot be null or empty'
+      USING ERRCODE = '22023';
+  END IF;
+
+  IF NOT EXISTS (
+    SELECT 1 FROM pg_timezone_names WHERE name = NEW.timezone
+  ) THEN
+    RAISE EXCEPTION 'Invalid IANA timezone: %', NEW.timezone
+      USING ERRCODE = '22023';
+  END IF;
+
+  RETURN NEW;
+END;
+$$;
+
+-- 2. Create updated_at trigger helper
+CREATE OR REPLACE FUNCTION public.set_current_timestamp_updated_at()
+RETURNS trigger
+LANGUAGE plpgsql
+SECURITY DEFINER
+SET search_path = ''
+AS $$
+BEGIN
+  NEW.updated_at = now();
+  RETURN NEW;
+END;
+$$;
+
+-- 3. Create table
 CREATE TABLE IF NOT EXISTS public.profiles (
   id uuid PRIMARY KEY REFERENCES auth.users(id) ON DELETE CASCADE,
   display_name text,
@@ -17,25 +55,19 @@ CREATE TABLE IF NOT EXISTS public.profiles (
   CONSTRAINT check_timezone_length CHECK (char_length(timezone) <= 64)
 );
 
--- 2. Create updated_at trigger helper
-CREATE OR REPLACE FUNCTION public.set_current_timestamp_updated_at()
-RETURNS trigger
-LANGUAGE plpgsql
-SECURITY DEFINER
-SET search_path = ''
-AS $$
-BEGIN
-  NEW.updated_at = now();
-  RETURN NEW;
-END;
-$$;
+-- Timezone validation trigger on INSERT and UPDATE
+CREATE OR REPLACE TRIGGER trg_profiles_validate_timezone
+BEFORE INSERT OR UPDATE OF timezone ON public.profiles
+FOR EACH ROW
+EXECUTE FUNCTION public.validate_timezone_name();
 
+-- Updated_at trigger
 CREATE OR REPLACE TRIGGER trg_profiles_updated_at
 BEFORE UPDATE ON public.profiles
 FOR EACH ROW
 EXECUTE FUNCTION public.set_current_timestamp_updated_at();
 
--- 3. is_admin() helper function
+-- 4. is_admin() helper function
 -- Must be STABLE SECURITY DEFINER with fixed empty search_path
 CREATE OR REPLACE FUNCTION public.is_admin()
 RETURNS boolean
@@ -53,10 +85,10 @@ AS $$
   );
 $$;
 
--- 4. Enable RLS
+-- 5. Enable RLS
 ALTER TABLE public.profiles ENABLE ROW LEVEL SECURITY;
 
--- 5. Revoke broad permissions and configure column-level security
+-- 6. Revoke broad permissions and configure column-level security
 REVOKE ALL ON TABLE public.profiles FROM anon, PUBLIC;
 REVOKE ALL ON TABLE public.profiles FROM authenticated;
 
@@ -64,17 +96,17 @@ REVOKE ALL ON TABLE public.profiles FROM authenticated;
 GRANT SELECT ON TABLE public.profiles TO authenticated;
 
 -- Column-level update restriction: learners may update only display_name, teaching_language, and timezone.
--- Updates to role, is_active, id, or created_at fail with a permission error.
+-- Updates to role, is_active, id, or created_at fail with 42501 permission error.
 GRANT UPDATE (display_name, teaching_language, timezone) ON TABLE public.profiles TO authenticated;
 
--- 6. RLS Policies for profiles
--- Learners can view their own profile only if active
+-- 7. RLS Policies for profiles
+-- Self-SELECT policy: does NOT require is_active so a disabled user can read their own row
 CREATE POLICY "profiles_select_own"
   ON public.profiles
   FOR SELECT
   TO authenticated
   USING (
-    (SELECT auth.uid()) = id AND is_active = true
+    (SELECT auth.uid()) = id
   );
 
 -- Admins can view all profiles
@@ -98,7 +130,7 @@ CREATE POLICY "profiles_update_own"
     (SELECT auth.uid()) = id AND is_active = true
   );
 
--- 7. Signup trigger to create profile
+-- 8. Signup trigger to create profile
 -- Always forces role = 'learner' and is_active = true, ignoring any client-provided role or status.
 CREATE OR REPLACE FUNCTION public.handle_new_user()
 RETURNS trigger
@@ -110,6 +142,8 @@ DECLARE
   v_raw_lang text;
   v_lang text;
   v_display_name text;
+  v_raw_tz text;
+  v_tz text;
 BEGIN
   -- Extract and sanitize teaching_language metadata
   v_raw_lang := lower(trim(COALESCE(NEW.raw_user_meta_data->>'teaching_language', 'tamil')));
@@ -123,6 +157,14 @@ BEGIN
   v_display_name := NULLIF(trim(NEW.raw_user_meta_data->>'display_name'), '');
   IF v_display_name IS NOT NULL AND char_length(v_display_name) > 100 THEN
     v_display_name := substring(v_display_name FROM 1 FOR 100);
+  END IF;
+
+  -- Extract and validate timezone if provided, otherwise default to UTC
+  v_raw_tz := trim(COALESCE(NEW.raw_user_meta_data->>'timezone', 'UTC'));
+  IF v_raw_tz IS NOT NULL AND v_raw_tz <> '' AND EXISTS (SELECT 1 FROM pg_timezone_names WHERE name = v_raw_tz) THEN
+    v_tz := v_raw_tz;
+  ELSE
+    v_tz := 'UTC';
   END IF;
 
   INSERT INTO public.profiles (
@@ -139,7 +181,7 @@ BEGIN
     v_display_name,
     v_lang,
     'learner',     -- Hardcoded security default
-    'UTC',
+    v_tz,
     true,          -- Hardcoded security default
     now(),
     now()
@@ -158,5 +200,6 @@ CREATE OR REPLACE TRIGGER on_auth_user_created
 -- Revoke execute on trigger and internal functions
 REVOKE ALL ON FUNCTION public.handle_new_user() FROM anon, authenticated, PUBLIC;
 REVOKE ALL ON FUNCTION public.set_current_timestamp_updated_at() FROM anon, authenticated, PUBLIC;
+REVOKE ALL ON FUNCTION public.validate_timezone_name() FROM anon, authenticated, PUBLIC;
 REVOKE ALL ON FUNCTION public.is_admin() FROM anon, PUBLIC;
 GRANT EXECUTE ON FUNCTION public.is_admin() TO authenticated;

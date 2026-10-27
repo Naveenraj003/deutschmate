@@ -1,9 +1,9 @@
 -- Migration 00002: Create learning_events table and RLS policies
 -- Description: Client-generated idempotent append-only telemetry stream for self-reported progress.
 
--- 1. Create table
+-- 1. Create table with reward_date NOT NULL
 CREATE TABLE IF NOT EXISTS public.learning_events (
-  id uuid PRIMARY KEY, -- Client-generated idempotency key
+  id uuid PRIMARY KEY, -- Client-generated idempotency key (learning_events_pkey)
   user_id uuid NOT NULL DEFAULT auth.uid() REFERENCES auth.users(id) ON DELETE CASCADE,
   event_type text NOT NULL,
   lesson_id text,
@@ -12,14 +12,16 @@ CREATE TABLE IF NOT EXISTS public.learning_events (
   payload jsonb NOT NULL DEFAULT '{}'::jsonb,
   client_created_at timestamptz,
   created_at timestamptz NOT NULL DEFAULT now(),
+  reward_date date NOT NULL,
   CONSTRAINT check_event_type_allowlist CHECK (
-    event_type IN ('lesson_completed', 'exercise_correct', 'review_correct')
+    event_type IN ('lesson_completed', 'exercise_correct', 'review_correct', 'exercise_incorrect')
+  ),
+  CONSTRAINT check_exercise_events_require_exercise_id CHECK (
+    (event_type IN ('exercise_correct', 'exercise_incorrect') AND exercise_id IS NOT NULL AND char_length(exercise_id) BETWEEN 1 AND 64)
+    OR (event_type NOT IN ('exercise_correct', 'exercise_incorrect'))
   ),
   CONSTRAINT check_lesson_id_length CHECK (
     lesson_id IS NULL OR (char_length(lesson_id) BETWEEN 1 AND 64)
-  ),
-  CONSTRAINT check_exercise_id_length CHECK (
-    exercise_id IS NULL OR (char_length(exercise_id) BETWEEN 1 AND 64)
   ),
   CONSTRAINT check_word_id_length CHECK (
     word_id IS NULL OR (char_length(word_id) BETWEEN 1 AND 64)
@@ -29,26 +31,75 @@ CREATE TABLE IF NOT EXISTS public.learning_events (
   )
 );
 
--- 2. Concurrency-safe unique constraint to prevent duplicate exercise XP on same server UTC day
-CREATE UNIQUE INDEX IF NOT EXISTS idx_learning_events_exercise_daily_unique
-  ON public.learning_events (user_id, exercise_id, ((created_at AT TIME ZONE 'UTC')::date))
-  WHERE event_type = 'exercise_correct' AND exercise_id IS NOT NULL;
+-- 2. BEFORE INSERT trigger helper: server timestamps, user timezone lookup, no UTC fallback
+CREATE OR REPLACE FUNCTION public.set_learning_event_server_fields()
+RETURNS trigger
+LANGUAGE plpgsql
+SECURITY DEFINER
+SET search_path = ''
+AS $$
+DECLARE
+  v_tz text;
+BEGIN
+  -- Force authoritative user_id from auth.uid() if not already set or defaulted
+  IF NEW.user_id IS NULL THEN
+    NEW.user_id := (SELECT auth.uid());
+  END IF;
 
--- 3. Query index for user timeline queries
+  -- Lookup user timezone from public.profiles
+  SELECT timezone INTO v_tz
+  FROM public.profiles
+  WHERE id = NEW.user_id;
+
+  -- Raise exception if no profile exists (NO UTC fallback)
+  IF NOT FOUND OR v_tz IS NULL THEN
+    RAISE EXCEPTION 'No profile found for user %: cannot resolve timezone for learning event', NEW.user_id
+      USING ERRCODE = 'P0002';
+  END IF;
+
+  -- Always set created_at and reward_date authoritatively on the server
+  NEW.created_at := now();
+  NEW.reward_date := (now() AT TIME ZONE v_tz)::date;
+
+  RETURN NEW;
+END;
+$$;
+
+CREATE OR REPLACE TRIGGER trg_learning_events_set_server_fields
+BEFORE INSERT ON public.learning_events
+FOR EACH ROW
+EXECUTE FUNCTION public.set_learning_event_server_fields();
+
+-- 3. Concurrency-safe unique index with stable name idx_events_exercise_daily
+-- exercise_incorrect is outside this index (WHERE event_type = 'exercise_correct')
+CREATE UNIQUE INDEX IF NOT EXISTS idx_events_exercise_daily
+  ON public.learning_events (user_id, exercise_id, reward_date)
+  WHERE event_type = 'exercise_correct';
+
+-- 4. Query indexes
+CREATE INDEX IF NOT EXISTS idx_learning_events_user_reward_date
+  ON public.learning_events (user_id, reward_date DESC);
+
 CREATE INDEX IF NOT EXISTS idx_learning_events_user_created_at
   ON public.learning_events (user_id, created_at DESC);
 
--- 4. Enable RLS
+-- 5. Enable RLS
 ALTER TABLE public.learning_events ENABLE ROW LEVEL SECURITY;
 
--- 5. Revoke broad privileges and configure permissions
+-- 6. Revoke broad privileges and configure permissions
 REVOKE ALL ON TABLE public.learning_events FROM anon, PUBLIC;
 REVOKE ALL ON TABLE public.learning_events FROM authenticated;
 
--- Grant only SELECT and INSERT (Append-only: No UPDATE, No DELETE)
-GRANT SELECT, INSERT ON TABLE public.learning_events TO authenticated;
+-- Allow authenticated users to SELECT records allowed by RLS
+GRANT SELECT ON TABLE public.learning_events TO authenticated;
 
--- 6. RLS Policies
+-- Grant INSERT ONLY on client-settable columns (created_at, reward_date, user_id are server-managed)
+GRANT INSERT (id, event_type, lesson_id, exercise_id, word_id, payload, client_created_at)
+  ON TABLE public.learning_events TO authenticated;
+
+-- Note: No UPDATE or DELETE is granted to authenticated or anon, causing 42501 permission error on mutation attempts.
+
+-- 7. RLS Policies
 -- Learners may read their own events only while active
 CREATE POLICY "learning_events_select_own"
   ON public.learning_events
@@ -75,4 +126,5 @@ CREATE POLICY "learning_events_insert_own"
     )
   );
 
--- Note: No UPDATE or DELETE policies are defined, preventing any record modification.
+-- Revoke execute on internal trigger
+REVOKE ALL ON FUNCTION public.set_learning_event_server_fields() FROM anon, authenticated, PUBLIC;

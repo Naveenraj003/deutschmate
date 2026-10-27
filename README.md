@@ -29,12 +29,30 @@ npm run preview
 ## Database Architecture & Supabase Migrations
 
 Reviewable migrations reside under `supabase/migrations/`:
-1. `20261024000001_create_profiles.sql`: Profiles table, signup trigger, RLS policies, and column-level privileges.
-2. `20261024000002_create_learning_events.sql`: Append-only learning telemetry, idempotency keys, and daily unique exercise indexes.
-3. `20261024000003_create_feedback.sql`: Bug reports, content corrections, and suggestions.
-4. `20261024000004_create_admin_functions.sql`: `admin_set_user_active`, `admin_set_feedback_status`, and `get_admin_learner_summary`.
+1. `20261024000001_create_profiles.sql`: Profiles table, timezone validation trigger (`pg_timezone_names`), column privileges, self-SELECT without `is_active` requirement, and signup trigger.
+2. `20261024000002_create_learning_events.sql`: Append-only telemetry with `reward_date NOT NULL`, BEFORE INSERT trigger (resolving user timezone without UTC fallback), column-level INSERT grants, check constraints, and stable unique index `idx_events_exercise_daily`.
+3. `20261024000003_create_feedback.sql`: Bug reports, content corrections, and suggestions with server-defaulted status and restricted column-level INSERT grants.
+4. `20261024000004_create_admin_functions.sql`: `admin_set_user_active`, `admin_set_feedback_status`, and `get_admin_learner_summary` calculating 200 XP/day cap and consecutive streaks using `(reward_date - row_number)`.
 
-> **Note on Migration Execution**: In strict review mode, migrations must NOT be applied to any remote database automatically. Always review and apply via approved migration tooling in local staging first.
+---
+
+## Sync Client Contract: Idempotency & Error Handling (HTTP / Postgres 23505)
+
+When the offline or sync client submits learning events to Supabase:
+
+1. **Submission Strategy**:
+   The client generates a client-side UUID for each event (`id`) and sends an insert with `on_conflict=id` and `ignore-duplicates` (PostgREST upsert with `resolution=ignore-duplicates` or `ON CONFLICT (id) DO NOTHING`).
+   - Retried events with the same client UUID are **silently accepted** without duplicate processing or errors.
+
+2. **Handling Unique Constraint Violation (`23505`)**:
+   If the database returns SQLSTATE `23505` (Unique Violation), the client inspects the error payload / constraint name:
+   - **`learning_events_pkey`**: Event already received and recorded by the server. **Drop event from the offline sync queue**.
+   - **`idx_events_exercise_daily`**: The user has already earned XP for this specific `exercise_id` on this `reward_date`. No further XP will be awarded today for this exercise. **Drop event from the offline sync queue**.
+   - **Any other constraint / error**: Network error, schema mismatch, or temporary condition. **Keep event in the sync queue and retry later**.
+
+3. **Timezone Changes & Streak Impact**:
+   - The frontend automatically detects the browser's IANA timezone (e.g., via `Intl.DateTimeFormat().resolvedOptions().timeZone`) and updates `profiles.timezone` on login if different.
+   - Historical events store immutable `reward_date` values recorded at insertion time. A subsequent timezone change only shifts future daily boundaries; it never mutates historical reward dates.
 
 ---
 
@@ -66,11 +84,11 @@ To promote the initial trusted administrator:
 
 ## Running Database Tests (pgTAP)
 
-A test suite verifying RLS boundaries, column update rejections, idempotency, and admin RPC security is located at `supabase/tests/security_and_rls_test.sql`.
+A test suite verifying RLS boundaries, column update rejections, idempotency, and admin RPC security is located at `supabase/tests/security_and_rls_test.sql` (32 tests).
 
-To run tests in a local Supabase test container (with `pgtap` extension):
+To run tests in a local Supabase test container (with Docker running):
 ```bash
-# Run using local Supabase CLI (never against remote/production)
-supabase test db --local
+# Run using local Supabase CLI
+npx supabase test db --local
 ```
-Or execute `supabase/tests/security_and_rls_test.sql` inside a test PostgreSQL instance that has `auth.users` mock tables and `pgtap` installed.
+> **Local Environment Status**: If Docker Desktop is not installed or running on the machine, `npx supabase test db --local` cannot connect to a local PostgreSQL daemon (`connect ECONNREFUSED 127.0.0.1:54322`). In this case, tests are marked **UNEXECUTED** until a local Docker engine is started.

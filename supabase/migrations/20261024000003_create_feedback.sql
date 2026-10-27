@@ -39,9 +39,15 @@ ALTER TABLE public.feedback ENABLE ROW LEVEL SECURITY;
 REVOKE ALL ON TABLE public.feedback FROM anon, PUBLIC;
 REVOKE ALL ON TABLE public.feedback FROM authenticated;
 
--- Grant SELECT and INSERT only to authenticated
--- No direct UPDATE is granted to authenticated; status changes MUST go through admin_set_feedback_status RPC.
-GRANT SELECT, INSERT ON TABLE public.feedback TO authenticated;
+-- Allow authenticated users to SELECT records allowed by RLS
+GRANT SELECT ON TABLE public.feedback TO authenticated;
+
+-- Grant INSERT only on client-provided fields.
+-- id, user_id, status, and created_at are generated/defaulted server-side.
+GRANT INSERT (category, message, lesson_id, exercise_id)
+  ON TABLE public.feedback TO authenticated;
+
+-- Direct UPDATE is revoked from authenticated; status changes MUST go through admin_set_feedback_status RPC.
 
 -- 5. RLS Policies
 -- Learners may view their own feedback; Admins may view all feedback

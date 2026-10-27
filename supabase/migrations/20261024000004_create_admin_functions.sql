@@ -1,5 +1,5 @@
 -- Migration 00004: Admin RPCs and server-derived aggregate functions
--- Description: SECURITY DEFINER operations for admin user management, feedback status, and progress reporting.
+-- Description: SECURITY DEFINER operations for admin user management, feedback status, and progress reporting using reward_date.
 
 -- 1. admin_set_user_active
 -- Toggles learner active status. Rejects self-deactivation and non-admin calls.
@@ -18,7 +18,7 @@ DECLARE
 BEGIN
   v_caller_id := (SELECT auth.uid());
 
-  -- 1. Check admin authorization
+  -- 1. Check admin authorization (must be active admin)
   IF NOT public.is_admin() THEN
     RAISE EXCEPTION 'Access denied: caller is not an active administrator.'
       USING ERRCODE = '42501';
@@ -65,7 +65,7 @@ SECURITY DEFINER
 SET search_path = ''
 AS $$
 BEGIN
-  -- 1. Check admin authorization
+  -- 1. Check admin authorization (must be active admin)
   IF NOT public.is_admin() THEN
     RAISE EXCEPTION 'Access denied: caller is not an active administrator.'
       USING ERRCODE = '42501';
@@ -98,14 +98,20 @@ $$;
 -- 3. get_admin_learner_summary
 -- Server-derived aggregate analytics.
 -- Rules:
---  - Derived from learning_events using server created_at only (client_created_at ignored).
+--  - Derived from learning_events using stored reward_date and server created_at.
 --  - Client-supplied XP ignored; server applies exact rules:
 --      * lesson_completed = 50 XP
---      * exercise_correct = 10 XP (at most once per exercise per UTC day)
+--      * exercise_correct = 10 XP (at most once per exercise per reward_date)
 --      * review_correct = 5 XP
---      * Daily XP cap = 200 XP per calendar day in user's timezone.
---  - Streak = consecutive local calendar days containing >= 1 eligible event, anchored to today/yesterday.
---  - Self-reported caveat documented in payload metadata.
+--      * exercise_incorrect = 0 XP
+--      * Daily XP cap = 200 XP per reward_date.
+--  - Streak calculation:
+--      * Counts consecutive calendar days with at least one eligible event:
+--        ('lesson_completed', 'exercise_correct', 'review_correct', 'exercise_incorrect').
+--      * Days containing ONLY exercise_incorrect maintain the streak (0 XP earned).
+--      * Group consecutive dates by (reward_date - row_number):
+--        The current streak is the run ending today or yesterday (relative to user's current timezone).
+--      * Note: a later timezone change can shift today's boundary once, but historical reward_date is immutable.
 CREATE OR REPLACE FUNCTION public.get_admin_learner_summary(
   target_user_id uuid
 )
@@ -121,10 +127,10 @@ DECLARE
   v_total_xp integer := 0;
   v_current_streak integer := 0;
   v_events_count bigint := 0;
-  v_today_date date;
-  v_yesterday_date date;
+  v_today date;
+  v_yesterday date;
 BEGIN
-  -- 1. Verify caller is admin
+  -- 1. Verify caller is active admin
   IF NOT public.is_admin() THEN
     RAISE EXCEPTION 'Access denied: caller is not an active administrator.'
       USING ERRCODE = '42501';
@@ -140,7 +146,6 @@ BEGIN
       USING ERRCODE = '02000';
   END IF;
 
-  -- Default to UTC if invalid or missing
   IF v_user_tz IS NULL OR v_user_tz = '' THEN
     v_user_tz := 'UTC';
   END IF;
@@ -155,14 +160,15 @@ BEGIN
   FROM public.learning_events
   WHERE user_id = target_user_id;
 
-  -- 4. Calculate Server-Derived XP with Daily Cap (200 XP / day in user timezone)
+  -- 4. Calculate Server-Derived XP with Daily Cap (200 XP / reward_date)
   WITH daily_raw_events AS (
     SELECT
-      (created_at AT TIME ZONE v_user_tz)::date AS local_date,
+      reward_date,
       CASE
         WHEN event_type = 'lesson_completed' THEN 50
         WHEN event_type = 'exercise_correct' THEN 10
         WHEN event_type = 'review_correct' THEN 5
+        WHEN event_type = 'exercise_incorrect' THEN 0
         ELSE 0
       END AS event_xp
     FROM public.learning_events
@@ -170,49 +176,53 @@ BEGIN
   ),
   daily_capped_xp AS (
     SELECT
-      local_date,
+      reward_date,
       LEAST(200, SUM(event_xp)) AS day_xp
     FROM daily_raw_events
-    GROUP BY local_date
+    GROUP BY reward_date
   )
   SELECT COALESCE(SUM(day_xp), 0)::integer
   INTO v_total_xp
   FROM daily_capped_xp;
 
-  -- 5. Calculate Consecutive Streak Days
-  v_today_date := (now() AT TIME ZONE v_user_tz)::date;
-  v_yesterday_date := v_today_date - 1;
+  -- 5. Calculate Consecutive Streak Days using (reward_date - row_number)
+  -- Eligible streak events explicitly encode: lesson_completed, exercise_correct, review_correct, exercise_incorrect
+  v_today := (now() AT TIME ZONE v_user_tz)::date;
+  v_yesterday := v_today - 1;
 
-  WITH active_days AS (
-    SELECT DISTINCT (created_at AT TIME ZONE v_user_tz)::date AS act_date
+  WITH active_dates AS (
+    SELECT DISTINCT reward_date
     FROM public.learning_events
     WHERE user_id = target_user_id
+      AND event_type IN ('lesson_completed', 'exercise_correct', 'review_correct', 'exercise_incorrect')
   ),
-  numbered_days AS (
+  grouped_dates AS (
     SELECT
-      act_date,
-      row_number() OVER (ORDER BY act_date DESC) AS rn,
-      act_date + (row_number() OVER (ORDER BY act_date DESC) * INTERVAL '1 day') AS grp
-    FROM active_days
+      reward_date,
+      (reward_date - (row_number() OVER (ORDER BY reward_date))::integer) AS grp
+    FROM active_dates
   ),
-  streak_group AS (
-    -- Streak must include today or yesterday to be active
-    SELECT grp, COUNT(*) AS len
-    FROM numbered_days
-    WHERE act_date >= v_yesterday_date
+  streak_runs AS (
+    SELECT
+      grp,
+      COUNT(*)::integer AS streak_length,
+      MAX(reward_date) AS end_date
+    FROM grouped_dates
     GROUP BY grp
-    LIMIT 1
   )
-  SELECT COALESCE(len, 0)::integer
+  SELECT COALESCE(streak_length, 0)
   INTO v_current_streak
-  FROM streak_group;
+  FROM streak_runs
+  WHERE end_date IN (v_today, v_yesterday)
+  ORDER BY end_date DESC
+  LIMIT 1;
 
   -- 6. Return Structured Summary
   RETURN jsonb_build_object(
     'user_id', target_user_id,
     'total_reported_events', v_events_count,
     'server_derived_xp', v_total_xp,
-    'current_day_streak', v_current_streak,
+    'current_day_streak', COALESCE(v_current_streak, 0),
     'last_active_at', v_last_active,
     'learner_timezone', v_user_tz,
     'metrics_notice', 'Reported activity: exercise and lesson completions are recorded client-side and aggregated server-side under daily caps.'
